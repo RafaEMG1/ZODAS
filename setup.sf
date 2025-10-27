@@ -1,0 +1,41 @@
+# ==============================
+# Requisitos del proyecto ZODAS
+# ==============================
+# NOTA (Colab/Linux): para el solver CBC instala además el binario del solver
+#   !apt-get -y install coinor-cbc
+# o usa otro solver compatible si lo prefieres.
+
+# Núcleo de la app
+streamlit==1.29.0
+pandas==2.2.2
+numpy==1.26.4
+
+# Visualización
+matplotlib==3.8.4
+seaborn==0.13.2
+altair==5.2.0
+plotly==5.22.0
+pydeck
+
+# Cálculo / ML
+scipy==1.11.4
+scikit-learn==1.3.2
+imbalanced-learn==0.11.0
+xgboost==2.0.3
+joblib==1.3.2
+threadpoolctl==3.2.0
+
+# Optimización (MIP)
+pulp==2.8.0
+
+# Utilidades / datos
+requests==2.31.0
+kagglehub
+openpyxl==3.1.2
+
+# Análisis factorial / MCA
+mca
+prince==0.12.0
+
+# Grafos (wrapper de Graphviz; requiere binario del SO si vas a renderizar .dot)
+graphviz==0.20.3
