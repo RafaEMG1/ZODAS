@@ -1,9 +1,9 @@
-﻿departamento;lat;lon;municipio;produccion;producto
-Huila;29.345;-752.809;Neiva;1200;Café
-Huila;18.537;-760.511;Pitalito;1800;Café
-Huila;21.950;-756.270;Garzón;950;Leche
-Huila;23.931;-758.920;La Plata;700;Leche
-Meta;41.420;-736.266;Villavicencio;900;Guanábana
-Meta;35.469;-737.069;Granada;1100;Guanábana
-Meta;39.894;-737.655;Acacías;800;Leche
-Meta;40.997;-729.561;Puerto López;500;Café
+﻿departamento,lat,lon,municipio,produccion,producto
+Huila,29.345,-752.809,Neiva,1200,Café
+Huila,18.537,-760.511,Pitalito,1800,Café
+Huila,21.950,-756.270,Garzón,950,Leche
+Huila,23.931,-758.920,La Plata,700,Leche
+Meta,41.420,-736.266,Villavicencio,900,Guanábana
+Meta,35.469,-737.069,Granada,1100,Guanábana
+Meta,39.894,-737.655,Acacías,800,Leche
+Meta,40.997,-729.561,Puerto López,500,Café
