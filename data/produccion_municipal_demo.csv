@@ -1,9 +1,9 @@
-departamento,municipio,lat,lon,producto,produccion
-Huila,Neiva,2.9345,-75.2809,CafÈ,1200
-Huila,Pitalito,1.8537,-76.0511,CafÈ,1800
-Huila,GarzÛn,2.1950,-75.6270,Leche,950
-Huila,La Plata,2.3931,-75.8920,Leche,700
-Meta,Villavicencio,4.1420,-73.6266,Guan·bana,900
-Meta,Granada,3.5469,-73.7069,Guan·bana,1100
-Meta,AcacÌas,3.9894,-73.7655,Leche,800
-Meta,Puerto LÛpez,4.0997,-72.9561,CafÈ,500
+Ôªødepartamento;municipio;lat;lon;producto;produccion
+Huila;Neiva;29.345;-752.809;Caf√©;1200
+Huila;Pitalito;18.537;-760.511;Caf√©;1800
+Huila;Garz√≥n;21.950;-756.270;Leche;950
+Huila;La Plata;23.931;-758.920;Leche;700
+Meta;Villavicencio;41.420;-736.266;Guan√°bana;900
+Meta;Granada;35.469;-737.069;Guan√°bana;1100
+Meta;Acac√≠as;39.894;-737.655;Leche;800
+Meta;Puerto L√≥pez;40.997;-729.561;Caf√©;500
