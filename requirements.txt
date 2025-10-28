@@ -13,6 +13,6 @@ numpy
 pyomo
 highspy
 folium
-streamlit-folium
 pyproj
 altair
+
