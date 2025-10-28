@@ -97,8 +97,13 @@ if run_btn and len(forced_danes) >= 1:
     esri_path = Path(__file__).parent / "data" / "huila_municipios.json"
     try:
         geo_fc = esri_to_geojson_reproject(esri_path)
+        from streamlit.components.v1 import html
+
         fmap = build_map(geo_fc, datos["df_geo"], df_asigs, df_centros, datos["dane_to_name"], datos["dane_to_xy"])
-        st_folium(fmap, width=1000, height=600)
+        
+        # Renderizamos el HTML del mapa directamente (evita la serialización JSON de funciones)
+        map_html = fmap.get_root().render()
+        html(map_html, height=650)   # puedes ajustar el alto
     except Exception as e:
         st.error(f"No se pudo generar el mapa: {e}")
 
