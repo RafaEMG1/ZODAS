@@ -4,7 +4,7 @@
 # ============================================================
 
 from pathlib import Path
-import re, csv, json
+import re, csv, json, time, gc
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -246,8 +246,9 @@ def diagnostics(oferta, demanda, cap, K_ids, product, p, dmax, distOA, I_ids, J_
 
 # ------------------------------------------------------------
 # Modelo Pyomo + HiGHS (con DMAX y centroides forzados)
+# backend: "highs" (rápido) o "appsi_highs" (robusto en bucles)
 # ------------------------------------------------------------
-def build_and_solve(product, p, dmax, forced_danes, datos):
+def build_and_solve(product, p, dmax, forced_danes, datos, backend="highs"):
     oferta  = datos["oferta"]; demanda = datos["demanda"]
     distOA  = datos["distOA"]; distKD = datos["distKD"]
     cap     = datos["cap"]
@@ -333,16 +334,26 @@ def build_and_solve(product, p, dmax, forced_danes, datos):
     for k in forced_k:
         m.add_component(f"Force_{k}", pyo.Constraint(expr=m.T[k] == 1))
 
-    # Solve (preferimos HiGHS clásico; si no, appsi_highs)
+    # ---- Selección de solver robusta ----
     try:
-        solver = pyo.SolverFactory("highs")
-        solver.options["time_limit"] = 180
-        solver.options["mip_rel_gap"] = 0.01
-        solver.options["presolve"] = "on"
+        if backend == "appsi_highs":
+            solver = pyo.SolverFactory("appsi_highs")
+            solver.config.time_limit = 180
+            solver.config.load_solution = True
+            solver.config.stream_solver = False
+        else:
+            solver = pyo.SolverFactory("highs")
+            solver.options["time_limit"] = 180
+            solver.options["mip_rel_gap"] = 0.01
+            solver.options["presolve"] = "on"
     except Exception:
         solver = pyo.SolverFactory("appsi_highs")
+        solver.config.time_limit = 180
+        solver.config.load_solution = True
+        solver.config.stream_solver = False
 
-    res = solver.solve(m, tee=False)
+    # resolver (sin tee para evitar capture_output)
+    res = solver.solve(m)
     status = str(res.solver.termination_condition)
     msgs = []
     if status.lower() not in ("optimal", "optimal termination", "feasible"):
@@ -533,11 +544,14 @@ def build_map_html(geojson_fc, df_geo, df_asigs, df_centros, dane_to_name, dane_
 
 # ------------------------------------------------------------
 # Curva costo vs p (1..15, sin restricción de distancia, sin centros forzados)
+# Usa backend "appsi_highs" para evitar deadlocks al resolver en bucle
 # ------------------------------------------------------------
 def cost_curve_1_15(product, datos):
     points = []
     for p in range(1, 16):
-        m, msgs, _ = build_and_solve(product, p, dmax=1e9, forced_danes=[], datos=datos)
+        m, msgs, _ = build_and_solve(product, p, dmax=1e9, forced_danes=[], datos=datos, backend="appsi_highs")
+        gc.collect()
+        time.sleep(0.05)
         if (m is None) or msgs:
             points.append({"p": p, "costo": np.nan, "status": "infeasible"})
             continue
@@ -608,7 +622,13 @@ with tabs[0]:
         if len(forced_danes) > p:
             st.stop()
         with st.spinner("Resolviendo modelo..."):
-            m, msgs, forced_k = build_and_solve(producto, int(p), float(dmax), forced_danes, datos)
+            # Intento rápido con "highs"
+            m, msgs, forced_k = build_and_solve(producto, int(p), float(dmax), forced_danes, datos, backend="highs")
+            # Reintento robusto con "appsi_highs" si hubo problemas
+            if (m is None) or msgs:
+                m2, msgs2, _ = build_and_solve(producto, int(p), float(dmax), forced_danes, datos, backend="appsi_highs")
+                if (m2 is not None) and not msgs2:
+                    m, msgs = m2, []
 
         if (m is None) or msgs:
             # Mensaje claro para el usuario
@@ -676,4 +696,4 @@ with tabs[1]:
             )
             st.altair_chart(chart, use_container_width=True)
         else:
-            st.info("No se obtuvieron costos válidos en el rango 1..15 (posible infactibilidad). Intente con otro producto.")
+            st.info("No se obtuvieron costos válidos en el rango 1..15 (posible infactibilidad). Intenta con otro producto.")
