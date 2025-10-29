@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from streamlit.components.v1 import html
+import altair as alt
 
 # --- Modelado/solver
 import pyomo.environ as pyo
@@ -24,6 +25,8 @@ from pyproj import Transformer
 st.set_page_config(page_title="ZODAS - Optimización de Clústeres", layout="wide")
 
 DATA_DIR = Path(__file__).parent / "data"   # coloca tus .dat y archivos de Huila aquí
+P_MAX_UI = 20  # límite UI de clusters
+
 
 # ------------------------------------------------------------
 # Helpers generales
@@ -193,12 +196,21 @@ def cached_load_data():
     df_geo = load_huila_csv(csv_p)
     id_to_dane, dane_to_name, dane_to_xy = build_maps_from_csv(df_geo)
 
+    # Productos válidos robustos: intersección Oferta∩Demanda en TODOS los nodos
+    prods_oferta = set.intersection(*[set(d.keys()) for d in oferta.values()]) if oferta else set()
+    prods_demanda= set.intersection(*[set(d.keys()) for d in demanda.values()]) if demanda else set()
+    productos_validos = sorted(list(prods_oferta & prods_demanda))
+    if not productos_validos:
+        # fallback: unión de PACT con lo que exista
+        productos_validos = sorted(list((set(pact) | set(productos)) & prods_oferta & prods_demanda))
+
     return dict(
         productos=productos, pact=pact, cap=cap, p_default=p_default,
         ctr=ctr, ca=ca, tonco2=tonco2,
         oferta=oferta, demanda=demanda, distOA=distOA, distKD=distKD,
         I_ids=I_ids, J_ids=J_ids, K_ids=K_ids,
-        df_geo=df_geo, id_to_dane=id_to_dane, dane_to_name=dane_to_name, dane_to_xy=dane_to_xy
+        df_geo=df_geo, id_to_dane=id_to_dane, dane_to_name=dane_to_name, dane_to_xy=dane_to_xy,
+        productos_validos=productos_validos
     )
 
 
@@ -257,7 +269,7 @@ def build_and_solve(product, p, dmax, forced_danes, datos):
     forced_k = [k for k in forced_k if k is not None]
 
     if len(forced_k) > p:
-        return None, ["El número de centroides forzados excede p."], None
+        return None, [f"Seleccionaste {len(forced_k)} centros forzados, que excede p={p}. Reduce el número de centros forzados o aumenta p."], None
 
     m = pyo.ConcreteModel()
     m.I = pyo.Set(initialize=I_ids, ordered=True)
@@ -334,7 +346,7 @@ def build_and_solve(product, p, dmax, forced_danes, datos):
     status = str(res.solver.termination_condition)
     msgs = []
     if status.lower() not in ("optimal", "optimal termination", "feasible"):
-        msgs.append("No se encontró solución óptima factible.")
+        msgs.append("Motivo por el cual es infactible: no se encontró solución factible/óptima. Por favor intente ampliando el número de clústeres (p) o la distancia máxima entre el origen y el acopio (DMAX).")
 
     return m, msgs, forced_k
 
@@ -520,92 +532,148 @@ def build_map_html(geojson_fc, df_geo, df_asigs, df_centros, dane_to_name, dane_
 
 
 # ------------------------------------------------------------
+# Curva costo vs p (1..15, sin restricción de distancia, sin centros forzados)
+# ------------------------------------------------------------
+def cost_curve_1_15(product, datos):
+    points = []
+    for p in range(1, 16):
+        m, msgs, _ = build_and_solve(product, p, dmax=1e9, forced_danes=[], datos=datos)
+        if (m is None) or msgs:
+            points.append({"p": p, "costo": np.nan, "status": "infeasible"})
+            continue
+        try:
+            costo = _v(m.OBJ)
+            points.append({"p": p, "costo": float(costo), "status": "ok"})
+        except Exception as e:
+            points.append({"p": p, "costo": np.nan, "status": str(e)})
+    return pd.DataFrame(points)
+
+
+# ------------------------------------------------------------
 # UI
 # ------------------------------------------------------------
 st.title("ZODAS – Optimización de Clústeres Agrícolas (Huila)")
 
+datos = cached_load_data()
+
+# Productos válidos robustos
+productos_validos = datos["productos_validos"] if datos["productos_validos"] else (datos["pact"] or datos["productos"])
+if not productos_validos:
+    st.error("No se encontraron productos válidos en Oferta∩Demanda. Revisa los .dat.")
+    st.stop()
+
+# Sidebar parámetros
 with st.sidebar:
     st.header("Parámetros de entrada")
-    datos = cached_load_data()
 
-    # Productos válidos (en Oferta y Demanda)
-    posibles = datos["pact"] or datos["productos"]
-    productos_validos = [p for p in posibles if p in datos["oferta"][datos["I_ids"][0]] and p in datos["demanda"][datos["J_ids"][0]]]
     producto = st.selectbox("Producto", productos_validos, index=0)
 
     dmax = st.number_input("Distancia máxima O→A (km)", min_value=1.0, max_value=5000.0, value=150.0, step=1.0)
-    p = st.number_input("Cantidad de clústeres (p)", min_value=1, max_value=max(1,len(datos["K_ids"])), value=int(datos["p_default"]), step=1)
 
-    # centroides forzados (mínimo 1) – por nombre (convertimos a DANE)
+    # p limitado por UI a 20 y por |K|
+    p_max_allowed = min(P_MAX_UI, len(datos["K_ids"]))
+    p = st.number_input("Cantidad de clústeres (p)", min_value=1, max_value=p_max_allowed, value=min(datos["p_default"], p_max_allowed), step=1, help=f"Máximo permitido: {p_max_allowed}")
+
+    # centroides forzados (opcional): 0..p
     dane_to_name = datos["dane_to_name"]
     name_to_dane = {v: k for k, v in dane_to_name.items()}
     candidatos = sorted({dane_to_name.get(to_dane(k, datos["id_to_dane"], dane_to_name), f"ID {k}") for k in datos["K_ids"]})
-    forced_names = st.multiselect("Municipios que deben ser centros (mínimo 1)", options=candidatos, default=candidatos[:1])
+
+    forced_names = st.multiselect(
+        f"Municipios que deben ser centros (0..{p})",
+        options=candidatos,
+        default=[],
+        help="Opcional. Si seleccionas p=15, puedes escoger máximo 15 municipios."
+    )
     forced_danes = [name_to_dane[n] for n in forced_names if n in name_to_dane]
+    if len(forced_danes) > p:
+        st.error(f"Seleccionaste {len(forced_danes)} centros forzados pero p={p}. Reduce la cantidad de centros forzados o incrementa p.")
 
-    run_btn = st.button("Resolver")
+tabs = st.tabs(["Optimización", "Curva costo vs p"])
 
+# ------------------------- TAB 1 -------------------------
+with tabs[0]:
+    # Chequeos previos
+    prev_reasons = diagnostics(
+        datos["oferta"], datos["demanda"], datos["cap"], datos["K_ids"],
+        producto, int(p), float(dmax), datos["distOA"], datos["I_ids"], datos["J_ids"],
+        datos["id_to_dane"], datos["dane_to_name"]
+    )
+    if prev_reasons:
+        st.warning("**Chequeos previos** (posibles causas de infactibilidad):\n- " + "\n- ".join(prev_reasons))
 
-# Chequeos previos
-prev_reasons = diagnostics(
-    datos["oferta"], datos["demanda"], datos["cap"], datos["K_ids"],
-    producto, int(p), float(dmax), datos["distOA"], datos["I_ids"], datos["J_ids"],
-    datos["id_to_dane"], datos["dane_to_name"]
-)
+    run_btn = st.button("Resolver modelo", type="primary", use_container_width=False)
 
-if prev_reasons:
-    st.warning("**Chequeos previos** (posibles causas de infactibilidad):\n- " + "\n- ".join(prev_reasons))
+    if run_btn:
+        if len(forced_danes) > p:
+            st.stop()
+        with st.spinner("Resolviendo modelo..."):
+            m, msgs, forced_k = build_and_solve(producto, int(p), float(dmax), forced_danes, datos)
 
-if len(forced_danes) < 1:
-    st.info("Selecciona **al menos un municipio centroide** en la barra lateral para continuar.")
+        if (m is None) or msgs:
+            # Mensaje claro para el usuario
+            st.error("Motivo por el cual es infactible. Por favor intente ampliando el número de clústeres (p) o la distancia máxima entre el origen y el acopio (DMAX).")
+            if msgs:
+                for msg in msgs:
+                    st.info(msg)
+            st.stop()
 
-if run_btn and len(forced_danes) >= 1:
-    with st.spinner("Resolviendo modelo..."):
-        m, msgs, forced_k = build_and_solve(producto, int(p), float(dmax), forced_danes, datos)
+        # Resultados
+        df_centros, df_asigs, df_X, df_Y, obj_val = extract_results(m, datos, producto)
 
-    if m is None:
-        st.error("No se pudo construir/solucionar el modelo: " + "; ".join(msgs))
-        st.stop()
+        col1, col2, col3 = st.columns([1,1,1])
+        with col1:
+            st.metric("Costo total", f"{obj_val:,.2f}" if obj_val is not None else "—")
+            st.metric("Centros abiertos", len(df_centros))
+        with col2:
+            st.metric("Arcos O→A con flujo", len(df_X))
+        with col3:
+            st.metric("Arcos A→D con flujo", len(df_Y))
 
-    if msgs:
-        for msg in msgs:
-            st.warning(msg)
+        st.subheader("Centroides abiertos")
+        st.dataframe(df_centros, use_container_width=True)
 
-    # Resultados
-    df_centros, df_asigs, df_X, df_Y, obj_val = extract_results(m, datos, producto)
+        st.subheader("Asignaciones municipio → centro")
+        st.dataframe(df_asigs, use_container_width=True)
 
-    col1, col2, col3 = st.columns([1,1,1])
-    with col1:
-        st.metric("Costo total", f"{obj_val:,.2f}" if obj_val is not None else "—")
-        st.metric("Centros abiertos", len(df_centros))
-    with col2:
-        st.metric("Arcos O→A con flujo", len(df_X))
-    with col3:
-        st.metric("Arcos A→D con flujo", len(df_Y))
+        with st.expander("Flujos O→A (X)"):
+            st.dataframe(df_X, use_container_width=True)
+        with st.expander("Flujos A→D (Y)"):
+            st.dataframe(df_Y, use_container_width=True)
 
-    st.subheader("Centroides abiertos")
-    st.dataframe(df_centros, use_container_width=True)
+        # Descargas
+        st.download_button("Descargar centroides (CSV)", df_centros.to_csv(index=False).encode("utf-8"), "result_centroides.csv", "text/csv")
+        st.download_button("Descargar asignaciones (CSV)", df_asigs.to_csv(index=False).encode("utf-8"), "result_asignaciones.csv", "text/csv")
+        st.download_button("Descargar flujos O→A (CSV)", df_X.to_csv(index=False).encode("utf-8"), "result_flujos_X.csv", "text/csv")
+        st.download_button("Descargar flujos A→D (CSV)", df_Y.to_csv(index=False).encode("utf-8"), "result_flujos_Y.csv", "text/csv")
 
-    st.subheader("Asignaciones municipio → centro")
-    st.dataframe(df_asigs, use_container_width=True)
+        # Mapa
+        st.subheader("Mapa de clústeres")
+        esri_path = DATA_DIR / "huila_municipios.json"
+        try:
+            geo_fc = esri_to_geojson_reproject(esri_path)
+            map_html = build_map_html(geo_fc, datos["df_geo"], df_asigs, df_centros, datos["dane_to_name"], datos["dane_to_xy"])
+            html(map_html, height=650)   # HTML directo (estable)
+        except Exception as e:
+            st.error(f"No se pudo generar el mapa: {e}")
 
-    with st.expander("Flujos O→A (X)"):
-        st.dataframe(df_X, use_container_width=True)
-    with st.expander("Flujos A→D (Y)"):
-        st.dataframe(df_Y, use_container_width=True)
+# ------------------------- TAB 2 -------------------------
+with tabs[1]:
+    st.write("Ejecuta el modelo desde **1 a 15 clústeres** (sin restricción de distancias) para un producto seleccionado.")
+    producto_curve = st.selectbox("Producto para la curva", productos_validos, index=0, key="prod_curve")
+    run_curve = st.button("Calcular curva costo vs p (1..15)", type="primary")
 
-    # Descargas
-    st.download_button("Descargar centroides (CSV)", df_centros.to_csv(index=False).encode("utf-8"), "result_centroides.csv", "text/csv")
-    st.download_button("Descargar asignaciones (CSV)", df_asigs.to_csv(index=False).encode("utf-8"), "result_asignaciones.csv", "text/csv")
-    st.download_button("Descargar flujos O→A (CSV)", df_X.to_csv(index=False).encode("utf-8"), "result_flujos_X.csv", "text/csv")
-    st.download_button("Descargar flujos A→D (CSV)", df_Y.to_csv(index=False).encode("utf-8"), "result_flujos_Y.csv", "text/csv")
-
-    # Mapa
-    st.subheader("Mapa de clústeres")
-    esri_path = DATA_DIR / "huila_municipios.json"
-    try:
-        geo_fc = esri_to_geojson_reproject(esri_path)
-        map_html = build_map_html(geo_fc, datos["df_geo"], df_asigs, df_centros, datos["dane_to_name"], datos["dane_to_xy"])
-        html(map_html, height=650)   # HTML directo (estable)
-    except Exception as e:
-        st.error(f"No se pudo generar el mapa: {e}")
+    if run_curve:
+        with st.spinner("Calculando..."):
+            df_curve = cost_curve_1_15(producto_curve, datos)
+        st.dataframe(df_curve, use_container_width=True)
+        # chart
+        if df_curve["costo"].notna().any():
+            chart = alt.Chart(df_curve.dropna()).mark_line(point=True).encode(
+                x=alt.X('p:Q', title='# de clústeres'),
+                y=alt.Y('costo:Q', title='Costo total'),
+                tooltip=['p','costo','status']
+            )
+            st.altair_chart(chart, use_container_width=True)
+        else:
+            st.info("No se obtuvieron costos válidos en el rango 1..15 (posible infactibilidad). Intente con otro producto.")
