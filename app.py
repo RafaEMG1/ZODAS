@@ -1,6 +1,9 @@
 # ============================================================
 # ZODAS – Streamlit (archivo único)
-# Optimización de clústeres (Pyomo+HiGHS) + mapa Folium estable
+# Optimización de clústeres (Pyomo+HiGHS) + mapa Folium
+# - Curva costo vs p sin deadlock (appsi_highs)
+# - Tablas SIN códigos DANE
+# - Fix de tildes/mojibake
 # ============================================================
 
 from pathlib import Path
@@ -11,28 +14,21 @@ import streamlit as st
 from streamlit.components.v1 import html
 import altair as alt
 
-# --- Modelado/solver
 import pyomo.environ as pyo
-
-# --- Mapa
 import folium
 from pyproj import Transformer
 
-
 # ------------------------------------------------------------
-# Configuración Streamlit
+# Configuración
 # ------------------------------------------------------------
 st.set_page_config(page_title="ZODAS - Optimización de Clústeres", layout="wide")
-
-DATA_DIR = Path(__file__).parent / "data"   # coloca tus .dat y archivos de Huila aquí
-P_MAX_UI = 20  # límite UI de clusters
-
+DATA_DIR = Path(__file__).parent / "data"   # coloca tus .dat y archivos aquí
+P_MAX_UI = 20                               # p máximo en la UI
 
 # ------------------------------------------------------------
-# Helpers generales
+# Helpers
 # ------------------------------------------------------------
 def _to_int_safe(x):
-    """Normaliza códigos (p.ej. '041001 ') -> 41001"""
     if x is None: return None
     s = "".join(ch for ch in str(x).strip() if ch.isdigit())
     return int(s) if s else None
@@ -43,6 +39,24 @@ def _v(x):
         try: return float(x)
         except: return x
 
+# --- Fix tildes / mojibake (UTF-8 leído como latin-1) ---
+def _fix_name(s: str) -> str:
+    if s is None: return s
+    s = str(s)
+    try:
+        s2 = s.encode("latin-1", "ignore").decode("utf-8", "ignore")
+        if s2 and s2 != s:
+            return s2
+    except Exception:
+        pass
+    return s
+
+def _fix_names_in_df(df: pd.DataFrame) -> pd.DataFrame:
+    cols = [c for c in df.columns if c.endswith("_nombre") or c in ("centro_nombre","municipio","destino_nombre","origen_nombre")]
+    for c in cols:
+        if c in df.columns:
+            df[c] = df[c].map(_fix_name)
+    return df
 
 # ------------------------------------------------------------
 # Parsers AMPL .dat
@@ -120,12 +134,10 @@ def parse_param_matrix(path: Path, name: str):
     rows = sorted(mat.keys())
     return rows, head, mat
 
-
 # ------------------------------------------------------------
 # CSV DANE / nombres / coords
 # ------------------------------------------------------------
 def load_huila_csv(csv_path: Path) -> pd.DataFrame:
-    # lector robusto por si hay comillas duplicadas
     rows = []
     with open(csv_path, "r", encoding="latin-1", errors="ignore") as f:
         header = next(f).strip().split(",")
@@ -149,7 +161,7 @@ def load_huila_csv(csv_path: Path) -> pd.DataFrame:
 
 def build_maps_from_csv(df_geo: pd.DataFrame):
     id_to_dane   = {int(r.id_idx): int(r.dane_code) for _, r in df_geo.iterrows()}
-    dane_to_name = {int(r.dane_code): str(r.municipio) for _, r in df_geo.iterrows()}
+    dane_to_name = {int(r.dane_code): _fix_name(str(r.municipio)) for _, r in df_geo.iterrows()}
     dane_to_xy   = {int(r.dane_code): (float(r.lat), float(r.lon)) for _, r in df_geo.iterrows()}
     return id_to_dane, dane_to_name, dane_to_xy
 
@@ -158,7 +170,6 @@ def to_dane(x, id_to_dane, dane_to_name):
     if x in id_to_dane: return id_to_dane[x]
     if x in dane_to_name: return x
     return x
-
 
 # ------------------------------------------------------------
 # Carga de datos (cacheado)
@@ -191,18 +202,14 @@ def cached_load_data():
     K_ids = sorted(set(colsOA))
 
     assert set(I_ids) == set(rowsOA), "Filas DistanciaOrigenAcopio deben coincidir con Oferta (IDs)"
-    assert set(J_ids) == set(colsKD),  "Columnas DistanciaAcopioDestino deben coincidir con Demanda (IDs)"
+    assert set(J_ids) == set(colsKD), "Columnas DistanciaAcopioDestino deben coincidir con Demanda (IDs)"
 
     df_geo = load_huila_csv(csv_p)
     id_to_dane, dane_to_name, dane_to_xy = build_maps_from_csv(df_geo)
 
-    # Productos válidos robustos: intersección Oferta∩Demanda en TODOS los nodos
-    prods_oferta = set.intersection(*[set(d.keys()) for d in oferta.values()]) if oferta else set()
-    prods_demanda= set.intersection(*[set(d.keys()) for d in demanda.values()]) if demanda else set()
-    productos_validos = sorted(list(prods_oferta & prods_demanda))
-    if not productos_validos:
-        # fallback: unión de PACT con lo que exista
-        productos_validos = sorted(list((set(pact) | set(productos)) & prods_oferta & prods_demanda))
+    prods_oferta  = set.intersection(*[set(d.keys()) for d in oferta.values()]) if oferta else set()
+    prods_demanda = set.intersection(*[set(d.keys()) for d in demanda.values()]) if demanda else set()
+    productos_validos = sorted(list(prods_oferta & prods_demanda)) or sorted(list((set(pact) | set(productos)) & prods_oferta & prods_demanda))
 
     return dict(
         productos=productos, pact=pact, cap=cap, p_default=p_default,
@@ -213,9 +220,8 @@ def cached_load_data():
         productos_validos=productos_validos
     )
 
-
 # ------------------------------------------------------------
-# Diagnósticos previos
+# Diagnósticos previos (explican infactibilidad)
 # ------------------------------------------------------------
 def diagnostics(oferta, demanda, cap, K_ids, product, p, dmax, distOA, I_ids, J_ids, id_to_dane, dane_to_name):
     reasons = []
@@ -237,29 +243,26 @@ def diagnostics(oferta, demanda, cap, K_ids, product, p, dmax, distOA, I_ids, J_
     A_allowed = {(i,k) for i in I_ids for k in K_ids if distOA[i][k] <= float(dmax) + 1e-9}
     unreachable_i = [i for i in I_ids if all((i,k) not in A_allowed for k in K_ids)]
     if unreachable_i:
-        names = [f"{(dane_to_name.get(to_dane(i,id_to_dane,dane_to_name),'?'))} (DANE {to_dane(i,id_to_dane,dane_to_name)})" for i in unreachable_i[:10]]
+        names = [f"{(dane_to_name.get(to_dane(i,id_to_dane,dane_to_name),'?'))}" for i in unreachable_i[:10]]
         extra = " ..." if len(unreachable_i) > 10 else ""
         reasons.append(f"{len(unreachable_i)} municipio(s) sin acopio dentro de DMAX={dmax} km: " + ", ".join(names) + extra)
 
     return reasons
 
-
 # ------------------------------------------------------------
 # Modelo Pyomo + HiGHS (con DMAX y centroides forzados)
-# backend: "highs" (rápido) o "appsi_highs" (robusto en bucles)
+# backend: "highs" o "appsi_highs"
 # ------------------------------------------------------------
 def build_and_solve(product, p, dmax, forced_danes, datos, backend="highs"):
     oferta  = datos["oferta"]; demanda = datos["demanda"]
-    distOA  = datos["distOA"]; distKD = datos["distKD"]
+    distOA  = datos["distOA"];  distKD  = datos["distKD"]
     cap     = datos["cap"]
-    I_ids   = datos["I_ids"]; J_ids = datos["J_ids"]; K_ids = datos["K_ids"]
-    ctr     = datos["ctr"]; ca = datos["ca"]; tonco2 = datos["tonco2"]
+    I_ids   = datos["I_ids"];   J_ids   = datos["J_ids"];   K_ids = datos["K_ids"]
+    ctr     = datos["ctr"];     ca      = datos["ca"];       tonco2 = datos["tonco2"]
     id_to_dane = datos["id_to_dane"]; dane_to_name = datos["dane_to_name"]
 
-    # arcos permitidos O→A por DMAX
     A_allowed = {(i,k) for i in I_ids for k in K_ids if distOA[i][k] <= float(dmax) + 1e-9}
 
-    # mapear centros forzados (DANE) a k internos
     def dane_to_k(dane):
         for k in K_ids:
             if to_dane(k, id_to_dane, dane_to_name) == int(dane):
@@ -268,7 +271,6 @@ def build_and_solve(product, p, dmax, forced_danes, datos, backend="highs"):
 
     forced_k = [dane_to_k(int(d)) for d in forced_danes]
     forced_k = [k for k in forced_k if k is not None]
-
     if len(forced_k) > p:
         return None, [f"Seleccionaste {len(forced_k)} centros forzados, que excede p={p}. Reduce el número de centros forzados o aumenta p."], None
 
@@ -330,11 +332,9 @@ def build_and_solve(product, p, dmax, forced_danes, datos, backend="highs"):
         return _m.U[(i,k)] <= _m.T[k]
     m.LinkUT = pyo.Constraint(m.A, rule=link_ut)
 
-    # forzar centros
     for k in forced_k:
         m.add_component(f"Force_{k}", pyo.Constraint(expr=m.T[k] == 1))
 
-    # ---- Selección de solver robusta ----
     try:
         if backend == "appsi_highs":
             solver = pyo.SolverFactory("appsi_highs")
@@ -352,8 +352,7 @@ def build_and_solve(product, p, dmax, forced_danes, datos, backend="highs"):
         solver.config.load_solution = True
         solver.config.stream_solver = False
 
-    # resolver (sin tee para evitar capture_output)
-    res = solver.solve(m)
+    res = solver.solve(m)  # sin tee
     status = str(res.solver.termination_condition)
     msgs = []
     if status.lower() not in ("optimal", "optimal termination", "feasible"):
@@ -361,95 +360,86 @@ def build_and_solve(product, p, dmax, forced_danes, datos, backend="highs"):
 
     return m, msgs, forced_k
 
-
 # ------------------------------------------------------------
-# Extracción de resultados
+# Extracción de resultados (solo NOMBRES, sin DANE)
 # ------------------------------------------------------------
 def extract_results(m, datos, product):
     id_to_dane = datos["id_to_dane"]; dane_to_name = datos["dane_to_name"]
     distOA = datos["distOA"]; distKD = datos["distKD"]; cap = datos["cap"]
     EPS = 1e-6
 
-    def to_name(d):
-        return dane_to_name.get(int(d), f"ID {d}")
+    def to_name_from_node(node_id):
+        dane = to_dane(node_id, id_to_dane, dane_to_name)
+        return _fix_name(dane_to_name.get(int(dane), f"ID {node_id}"))
 
-    # Centros
+    # CENTROS
     centros = []
     for k in m.K:
         if _v(m.T[k]) > 0.5:
-            fin = sum(_v(m.X[(i,k), product]) for i in m.I if (i,k) in m.A)
-            fout= sum(_v(m.Y[k, j, product]) for j in m.J)
-            top_i, best = None, -1.0
-            for i in m.I:
-                if (i,k) not in m.A: continue
-                val = _v(m.X[(i,k), product])
-                if val > best: best, top_i = val, i
-            k_dane = to_dane(k, id_to_dane, dane_to_name)
-            top_dane = to_dane(top_i, id_to_dane, dane_to_name) if top_i is not None else None
+            fin  = sum(_v(m.X[(i,k), product]) for i in m.I if (i,k) in m.A)
+            fout = sum(_v(m.Y[k, j, product]) for j in m.J)
             centros.append({
-                "centro_dane": int(k_dane),
-                "centro_nombre": to_name(k_dane),
-                "municipio_centro_dane": None if top_dane is None else int(top_dane),
-                "municipio_centro_nombre": None if top_dane is None else to_name(top_dane),
+                "centro_nombre": to_name_from_node(k),
                 "flujo_entrante_total": fin,
                 "flujo_saliente_total": fout,
                 "capacidad": cap.get(int(k), np.nan),
             })
-    df_centros = pd.DataFrame(centros).sort_values("centro_dane")
+    df_centros = pd.DataFrame(centros).sort_values("centro_nombre")
+    df_centros = _fix_names_in_df(df_centros)
 
-    # Asignaciones
+    # ASIGNACIONES
     asigs = []
     for i in m.I:
         ks = [k for k in m.K if (i,k) in m.A and _v(m.U[(i,k)]) > 0.5]
         if ks:
             k_best = max(ks, key=lambda kk: _v(m.X[(i,kk), product]))
             fl_i = _v(m.X[(i,k_best), product])
-            i_dane = to_dane(i, id_to_dane, dane_to_name)
-            k_dane = to_dane(k_best, id_to_dane, dane_to_name)
             asigs.append({
-                "municipio_dane": int(i_dane), "municipio_nombre": to_name(i_dane),
-                "centro_dane": int(k_dane), "centro_nombre": to_name(k_dane),
+                "municipio_nombre": to_name_from_node(i),
+                "centro_nombre": to_name_from_node(k_best),
                 "flujo_total_i_a_centro": fl_i
             })
-    df_asigs = pd.DataFrame(asigs).sort_values(["centro_dane","municipio_dane"])
+    df_asigs = pd.DataFrame(asigs).sort_values(["centro_nombre","municipio_nombre"])
+    df_asigs = _fix_names_in_df(df_asigs)
 
-    # Flujos X
+    # FLUJOS X
     rows_X = []
     for (i,k) in m.A:
         val = _v(m.X[(i,k), product])
         if abs(val) <= EPS: continue
         d = distOA[int(i)][int(k)]
-        i_d = to_dane(i, id_to_dane, dane_to_name)
-        k_d = to_dane(k, id_to_dane, dane_to_name)
         rows_X.append({
-            "origen_dane": int(i_d), "origen_nombre": to_name(i_d),
-            "centro_dane": int(k_d), "centro_nombre": to_name(k_d),
-            "producto": product, "flujo": val, "dist_km": d
+            "origen_nombre": to_name_from_node(i),
+            "centro_nombre": to_name_from_node(k),
+            "producto": product,
+            "flujo": val,
+            "dist_km": d
         })
-    df_X = pd.DataFrame(rows_X).sort_values(["centro_dane","origen_dane"])
+    df_X = pd.DataFrame(rows_X).sort_values(["centro_nombre","origen_nombre"])
+    df_X = _fix_names_in_df(df_X)
 
-    # Flujos Y
+    # FLUJOS Y
     rows_Y = []
     for k in m.K:
         for j in m.J:
             val = _v(m.Y[k, j, product])
             if abs(val) <= EPS: continue
             d = distKD[int(k)][int(j)]
-            j_d = to_dane(j, id_to_dane, dane_to_name)
-            k_d = to_dane(k, id_to_dane, dane_to_name)
             rows_Y.append({
-                "centro_dane": int(k_d), "centro_nombre": to_name(k_d),
-                "destino_dane": int(j_d), "destino_nombre": to_name(j_d),
-                "producto": product, "flujo": val, "dist_km": d
+                "centro_nombre": to_name_from_node(k),
+                "destino_nombre": to_name_from_node(j),
+                "producto": product,
+                "flujo": val,
+                "dist_km": d
             })
-    df_Y = pd.DataFrame(rows_Y).sort_values(["centro_dane","destino_dane"])
+    df_Y = pd.DataFrame(rows_Y).sort_values(["centro_nombre","destino_nombre"])
+    df_Y = _fix_names_in_df(df_Y)
 
     obj_val = _v(m.OBJ) if hasattr(m, "OBJ") else None
     return df_centros, df_asigs, df_X, df_Y, obj_val
 
-
 # ------------------------------------------------------------
-# ESRI JSON -> GeoJSON reproyectado (cacheado) y mapa Folium→HTML
+# ESRI JSON -> GeoJSON reproyectado y mapa Folium (HTML)
 # ------------------------------------------------------------
 @st.cache_data(show_spinner=False)
 def esri_to_geojson_reproject(esri_path: Path):
@@ -469,7 +459,7 @@ def esri_to_geojson_reproject(esri_path: Path):
         props = f.get("properties") or f.get("attributes") or {}
         mp = props.get("MpCodigo") or props.get("MPCodigo") or props.get("mpcodigo")
         props["MpCodigo_norm"] = _to_int_safe(mp)
-        props["MpNombre"] = props.get("MpNombre") or props.get("MPNombre") or props.get("mpnombre") or ""
+        props["MpNombre"] = _fix_name(props.get("MpNombre") or props.get("MPNombre") or props.get("mpnombre") or "")
         geom = f.get("geometry") or {}
         if "rings" in geom:
             rings = geom["rings"]
@@ -483,29 +473,25 @@ def esri_to_geojson_reproject(esri_path: Path):
 
 @st.cache_data(show_spinner=False)
 def build_map_html(geojson_fc, df_geo, df_asigs, df_centros, dane_to_name, dane_to_xy):
-    # centro del mapa
     coords_all = [(float(r.lat), float(r.lon)) for _, r in df_geo.dropna(subset=["lat","lon"]).iterrows()]
     clat = sum(a for a,_ in coords_all)/len(coords_all) if coords_all else 2.93
     clon = sum(b for _,b in coords_all)/len(coords_all) if coords_all else -75.28
     fmap = folium.Map(location=[clat, clon], zoom_start=8, tiles="cartodbpositron")
 
-    # paleta
     palette = ["#1f77b4","#ff7f0e","#2ca02c","#d62728","#9467bd","#8c564b","#e377c2","#7f7f7f","#bcbd22","#17becf"]
-    centros_orden = sorted(df_centros["centro_dane"].dropna().astype(int).unique()) if not df_centros.empty else []
-    color_by_centro = {int(c): palette[i % len(palette)] for i, c in enumerate(centros_orden)}
+    centros_orden = sorted(df_centros["centro_nombre"].dropna().unique()) if not df_centros.empty else []
+    color_by_centro = {c: palette[i % len(palette)] for i, c in enumerate(centros_orden)}
 
-    # mapping municipios->centro
     cluster_by_mun = {}
     if not df_asigs.empty:
         for _, r in df_asigs.iterrows():
-            cluster_by_mun[int(r["municipio_dane"])] = int(r["centro_dane"])
+            cluster_by_mun[_fix_name(r["municipio_nombre"])] = _fix_name(r["centro_nombre"])
 
-    # capa polígonos
     def style_fn(feat):
-        dane = feat["properties"].get("MpCodigo_norm")
-        if dane in cluster_by_mun:
-            c = cluster_by_mun[dane]
-            return {"fillColor": color_by_centro.get(int(c), "#cccccc"), "color": "#555", "weight": 0.8, "fillOpacity": 0.6}
+        nombre = _fix_name(feat["properties"].get("MpNombre",""))
+        c = cluster_by_mun.get(nombre)
+        if c:
+            return {"fillColor": color_by_centro.get(c, "#cccccc"), "color": "#555", "weight": 0.8, "fillOpacity": 0.6}
         else:
             return {"fillColor": "#ddd", "color": "#999", "weight": 0.5, "fillOpacity": 0.3}
 
@@ -516,52 +502,39 @@ def build_map_html(geojson_fc, df_geo, df_asigs, df_centros, dane_to_name, dane_
         tooltip=folium.GeoJsonTooltip(fields=["MpNombre","MpCodigo_norm"], aliases=["Municipio","DANE"])
     ).add_to(fmap)
 
-    # puntos de municipios
-    for _, r in df_geo.dropna(subset=["lat","lon"]).iterrows():
-        dane = int(r["dane_code"])
-        lat, lon = float(r["lat"]), float(r["lon"])
-        cc = cluster_by_mun.get(dane)
-        color = color_by_centro.get(int(cc), "#444444") if cc is not None else "#aaaaaa"
-        folium.CircleMarker(
-            location=[lat,lon], radius=3, color=color, fill=True, fill_opacity=0.85,
-            popup=f'{r["municipio"]} (DANE {dane})' + (f' → Centro {dane_to_name.get(int(cc), "")} ({int(cc)})' if cc else "")
-        ).add_to(fmap)
-
-    # marcadores de centros
+    # Marcadores: centros (usamos dane_to_xy)
     if not df_centros.empty:
         for _, r in df_centros.iterrows():
-            c_dane = int(r["centro_dane"])
-            lat, lon = dane_to_xy.get(c_dane, (None, None))
-            if None in (lat,lon): continue
-            folium.CircleMarker(
-                location=[lat,lon], radius=7, color=color_by_centro.get(c_dane, "#333"), fill=True, fill_opacity=0.95,
-                popup=f'Centro: {dane_to_name.get(c_dane, c_dane)} (DANE {c_dane})'
-            ).add_to(fmap)
+            # buscar (lat, lon) por nombre via inverse map
+            name = r["centro_nombre"]
+            # intenta encontrar cualquier DANE cuyo nombre coincida
+            maybe_danes = [k for k,v in dane_to_name.items() if _fix_name(v)==name]
+            if maybe_danes:
+                lat, lon = dane_to_xy.get(maybe_danes[0], (None, None))
+                if None not in (lat,lon):
+                    folium.CircleMarker(
+                        location=[lat,lon], radius=7, color=color_by_centro.get(name, "#333"),
+                        fill=True, fill_opacity=0.95, popup=f"Centro: {name}"
+                    ).add_to(fmap)
 
-    # devolver HTML listo (evita serialización de funciones en Streamlit)
     return fmap.get_root().render()
 
-
 # ------------------------------------------------------------
-# Curva costo vs p (1..15, sin restricción de distancia, sin centros forzados)
-# Usa backend "appsi_highs" para evitar deadlocks al resolver en bucle
+# Curva costo vs p (1..15) usando appsi_highs (robusto)
 # ------------------------------------------------------------
 def cost_curve_1_15(product, datos):
     points = []
     for p in range(1, 16):
         m, msgs, _ = build_and_solve(product, p, dmax=1e9, forced_danes=[], datos=datos, backend="appsi_highs")
-        gc.collect()
-        time.sleep(0.05)
+        gc.collect(); time.sleep(0.05)
         if (m is None) or msgs:
             points.append({"p": p, "costo": np.nan, "status": "infeasible"})
             continue
         try:
-            costo = _v(m.OBJ)
-            points.append({"p": p, "costo": float(costo), "status": "ok"})
+            points.append({"p": p, "costo": float(_v(m.OBJ)), "status": "ok"})
         except Exception as e:
             points.append({"p": p, "costo": np.nan, "status": str(e)})
     return pd.DataFrame(points)
-
 
 # ------------------------------------------------------------
 # UI
@@ -569,45 +542,34 @@ def cost_curve_1_15(product, datos):
 st.title("ZODAS – Optimización de Clústeres Agrícolas (Huila)")
 
 datos = cached_load_data()
-
-# Productos válidos robustos
 productos_validos = datos["productos_validos"] if datos["productos_validos"] else (datos["pact"] or datos["productos"])
 if not productos_validos:
     st.error("No se encontraron productos válidos en Oferta∩Demanda. Revisa los .dat.")
     st.stop()
 
-# Sidebar parámetros
 with st.sidebar:
     st.header("Parámetros de entrada")
-
     producto = st.selectbox("Producto", productos_validos, index=0)
-
     dmax = st.number_input("Distancia máxima O→A (km)", min_value=1.0, max_value=5000.0, value=150.0, step=1.0)
-
-    # p limitado por UI a 20 y por |K|
     p_max_allowed = min(P_MAX_UI, len(datos["K_ids"]))
-    p = st.number_input("Cantidad de clústeres (p)", min_value=1, max_value=p_max_allowed, value=min(datos["p_default"], p_max_allowed), step=1, help=f"Máximo permitido: {p_max_allowed}")
+    p = st.number_input("Cantidad de clústeres (p)", min_value=1, max_value=p_max_allowed,
+                        value=min(datos["p_default"], p_max_allowed), step=1, help=f"Máximo permitido: {p_max_allowed}")
 
-    # centroides forzados (opcional): 0..p
     dane_to_name = datos["dane_to_name"]
     name_to_dane = {v: k for k, v in dane_to_name.items()}
-    candidatos = sorted({dane_to_name.get(to_dane(k, datos["id_to_dane"], dane_to_name), f"ID {k}") for k in datos["K_ids"]})
+    candidatos = sorted({_fix_name(dane_to_name.get(to_dane(k, datos["id_to_dane"], dane_to_name), f"ID {k}")) for k in datos["K_ids"]})
 
-    forced_names = st.multiselect(
-        f"Municipios que deben ser centros (0..{p})",
-        options=candidatos,
-        default=[],
-        help="Opcional. Si seleccionas p=15, puedes escoger máximo 15 municipios."
-    )
+    forced_names = st.multiselect(f"Municipios que deben ser centros (0..{p})",
+                                  options=candidatos, default=[],
+                                  help="Opcional. Si p=15, selecciona máximo 15 municipios.")
     forced_danes = [name_to_dane[n] for n in forced_names if n in name_to_dane]
     if len(forced_danes) > p:
-        st.error(f"Seleccionaste {len(forced_danes)} centros forzados pero p={p}. Reduce la cantidad de centros forzados o incrementa p.")
+        st.error(f"Seleccionaste {len(forced_danes)} centros forzados pero p={p}. Reduce la cantidad o incrementa p.")
 
 tabs = st.tabs(["Optimización", "Curva costo vs p"])
 
 # ------------------------- TAB 1 -------------------------
 with tabs[0]:
-    # Chequeos previos
     prev_reasons = diagnostics(
         datos["oferta"], datos["demanda"], datos["cap"], datos["K_ids"],
         producto, int(p), float(dmax), datos["distOA"], datos["I_ids"], datos["J_ids"],
@@ -616,29 +578,22 @@ with tabs[0]:
     if prev_reasons:
         st.warning("**Chequeos previos** (posibles causas de infactibilidad):\n- " + "\n- ".join(prev_reasons))
 
-    run_btn = st.button("Resolver modelo", type="primary", use_container_width=False)
-
+    run_btn = st.button("Resolver modelo", type="primary")
     if run_btn:
         if len(forced_danes) > p:
             st.stop()
         with st.spinner("Resolviendo modelo..."):
-            # Intento rápido con "highs"
             m, msgs, forced_k = build_and_solve(producto, int(p), float(dmax), forced_danes, datos, backend="highs")
-            # Reintento robusto con "appsi_highs" si hubo problemas
-            if (m is None) or msgs:
+            if (m is None) or msgs:  # reintento robusto
                 m2, msgs2, _ = build_and_solve(producto, int(p), float(dmax), forced_danes, datos, backend="appsi_highs")
                 if (m2 is not None) and not msgs2:
                     m, msgs = m2, []
 
         if (m is None) or msgs:
-            # Mensaje claro para el usuario
             st.error("Motivo por el cual es infactible. Por favor intente ampliando el número de clústeres (p) o la distancia máxima entre el origen y el acopio (DMAX).")
-            if msgs:
-                for msg in msgs:
-                    st.info(msg)
+            for msg in msgs: st.info(msg)
             st.stop()
 
-        # Resultados
         df_centros, df_asigs, df_X, df_Y, obj_val = extract_results(m, datos, producto)
 
         col1, col2, col3 = st.columns([1,1,1])
@@ -650,30 +605,36 @@ with tabs[0]:
         with col3:
             st.metric("Arcos A→D con flujo", len(df_Y))
 
+        # --- Tablas (solo nombres) ---
         st.subheader("Centroides abiertos")
-        st.dataframe(df_centros, use_container_width=True)
+        cols_centros = ["centro_nombre","flujo_entrante_total","flujo_saliente_total","capacidad"]
+        st.dataframe(df_centros[cols_centros], use_container_width=True)
 
         st.subheader("Asignaciones municipio → centro")
-        st.dataframe(df_asigs, use_container_width=True)
+        cols_asigs = ["municipio_nombre","centro_nombre","flujo_total_i_a_centro"]
+        st.dataframe(df_asigs[cols_asigs], use_container_width=True)
 
         with st.expander("Flujos O→A (X)"):
-            st.dataframe(df_X, use_container_width=True)
+            cols_x = ["origen_nombre","centro_nombre","producto","flujo","dist_km"]
+            st.dataframe(df_X[cols_x], use_container_width=True)
+
         with st.expander("Flujos A→D (Y)"):
-            st.dataframe(df_Y, use_container_width=True)
+            cols_y = ["centro_nombre","destino_nombre","producto","flujo","dist_km"]
+            st.dataframe(df_Y[cols_y], use_container_width=True)
 
-        # Descargas
-        st.download_button("Descargar centroides (CSV)", df_centros.to_csv(index=False).encode("utf-8"), "result_centroides.csv", "text/csv")
-        st.download_button("Descargar asignaciones (CSV)", df_asigs.to_csv(index=False).encode("utf-8"), "result_asignaciones.csv", "text/csv")
-        st.download_button("Descargar flujos O→A (CSV)", df_X.to_csv(index=False).encode("utf-8"), "result_flujos_X.csv", "text/csv")
-        st.download_button("Descargar flujos A→D (CSV)", df_Y.to_csv(index=False).encode("utf-8"), "result_flujos_Y.csv", "text/csv")
+        # --- Descargas ---
+        st.download_button("Descargar centroides (CSV)", df_centros[cols_centros].to_csv(index=False).encode("utf-8"), "result_centroides.csv", "text/csv")
+        st.download_button("Descargar asignaciones (CSV)", df_asigs[cols_asigs].to_csv(index=False).encode("utf-8"), "result_asignaciones.csv", "text/csv")
+        st.download_button("Descargar flujos O→A (CSV)", df_X[cols_x].to_csv(index=False).encode("utf-8"), "result_flujos_X.csv", "text/csv")
+        st.download_button("Descargar flujos A→D (CSV)", df_Y[cols_y].to_csv(index=False).encode("utf-8"), "result_flujos_Y.csv", "text/csv")
 
-        # Mapa
+        # --- Mapa ---
         st.subheader("Mapa de clústeres")
         esri_path = DATA_DIR / "huila_municipios.json"
         try:
             geo_fc = esri_to_geojson_reproject(esri_path)
             map_html = build_map_html(geo_fc, datos["df_geo"], df_asigs, df_centros, datos["dane_to_name"], datos["dane_to_xy"])
-            html(map_html, height=650)   # HTML directo (estable)
+            html(map_html, height=650)
         except Exception as e:
             st.error(f"No se pudo generar el mapa: {e}")
 
@@ -687,7 +648,6 @@ with tabs[1]:
         with st.spinner("Calculando..."):
             df_curve = cost_curve_1_15(producto_curve, datos)
         st.dataframe(df_curve, use_container_width=True)
-        # chart
         if df_curve["costo"].notna().any():
             chart = alt.Chart(df_curve.dropna()).mark_line(point=True).encode(
                 x=alt.X('p:Q', title='# de clústeres'),
