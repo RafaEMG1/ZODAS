@@ -3,11 +3,11 @@
 # Optimización de clústeres (Pyomo+HiGHS) + mapa Folium
 # - Curva costo vs p sin deadlock (appsi_highs)
 # - Tablas SIN códigos DANE
-# - Fix de tildes/mojibake
+# - Nombres SIN tildes (á→a, ñ→n) y mapa coloreado por DANE
 # ============================================================
 
 from pathlib import Path
-import re, csv, json, time, gc
+import re, csv, json, time, gc, unicodedata
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -22,12 +22,19 @@ from pyproj import Transformer
 # Configuración
 # ------------------------------------------------------------
 st.set_page_config(page_title="ZODAS - Optimización de Clústeres", layout="wide")
-DATA_DIR = Path(__file__).parent / "data"   # coloca tus .dat y archivos aquí
-P_MAX_UI = 20                               # p máximo en la UI
+DATA_DIR = Path(__file__).parent / "data"
+P_MAX_UI = 20
 
 # ------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------
+def strip_accents(s: str) -> str:
+    if s is None: return s
+    s = str(s)
+    # Normaliza y elimina marcas diacríticas (tildes/ñ→n)
+    nfkd = unicodedata.normalize("NFKD", s)
+    return "".join(ch for ch in nfkd if not unicodedata.combining(ch)).replace("ß", "ss")
+
 def _to_int_safe(x):
     if x is None: return None
     s = "".join(ch for ch in str(x).strip() if ch.isdigit())
@@ -39,23 +46,11 @@ def _v(x):
         try: return float(x)
         except: return x
 
-# --- Fix tildes / mojibake (UTF-8 leído como latin-1) ---
-def _fix_name(s: str) -> str:
-    if s is None: return s
-    s = str(s)
-    try:
-        s2 = s.encode("latin-1", "ignore").decode("utf-8", "ignore")
-        if s2 and s2 != s:
-            return s2
-    except Exception:
-        pass
-    return s
-
 def _fix_names_in_df(df: pd.DataFrame) -> pd.DataFrame:
     cols = [c for c in df.columns if c.endswith("_nombre") or c in ("centro_nombre","municipio","destino_nombre","origen_nombre")]
     for c in cols:
         if c in df.columns:
-            df[c] = df[c].map(_fix_name)
+            df[c] = df[c].map(strip_accents)
     return df
 
 # ------------------------------------------------------------
@@ -156,12 +151,12 @@ def load_huila_csv(csv_path: Path) -> pd.DataFrame:
     df["dane_code"] = pd.to_numeric(df["dane_code"], errors="coerce").astype("Int64")
     df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
     df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
-    df["municipio"] = df["municipio"].astype(str).str.strip()
+    df["municipio"] = df["municipio"].astype(str).str.strip().map(strip_accents)
     return df[["id_idx","dane_code","municipio","lat","lon"]].dropna(subset=["id_idx","dane_code"])
 
 def build_maps_from_csv(df_geo: pd.DataFrame):
     id_to_dane   = {int(r.id_idx): int(r.dane_code) for _, r in df_geo.iterrows()}
-    dane_to_name = {int(r.dane_code): _fix_name(str(r.municipio)) for _, r in df_geo.iterrows()}
+    dane_to_name = {int(r.dane_code): str(r.municipio) for _, r in df_geo.iterrows()}  # ya sin tildes
     dane_to_xy   = {int(r.dane_code): (float(r.lat), float(r.lon)) for _, r in df_geo.iterrows()}
     return id_to_dane, dane_to_name, dane_to_xy
 
@@ -211,17 +206,21 @@ def cached_load_data():
     prods_demanda = set.intersection(*[set(d.keys()) for d in demanda.values()]) if demanda else set()
     productos_validos = sorted(list(prods_oferta & prods_demanda)) or sorted(list((set(pact) | set(productos)) & prods_oferta & prods_demanda))
 
+    # También guardo name_to_dane para joins por nombre
+    name_to_dane = {v: k for k, v in dane_to_name.items()}
+
     return dict(
         productos=productos, pact=pact, cap=cap, p_default=p_default,
         ctr=ctr, ca=ca, tonco2=tonco2,
         oferta=oferta, demanda=demanda, distOA=distOA, distKD=distKD,
         I_ids=I_ids, J_ids=J_ids, K_ids=K_ids,
         df_geo=df_geo, id_to_dane=id_to_dane, dane_to_name=dane_to_name, dane_to_xy=dane_to_xy,
+        name_to_dane=name_to_dane,
         productos_validos=productos_validos
     )
 
 # ------------------------------------------------------------
-# Diagnósticos previos (explican infactibilidad)
+# Diagnósticos (explican infactibilidad)
 # ------------------------------------------------------------
 def diagnostics(oferta, demanda, cap, K_ids, product, p, dmax, distOA, I_ids, J_ids, id_to_dane, dane_to_name):
     reasons = []
@@ -243,15 +242,14 @@ def diagnostics(oferta, demanda, cap, K_ids, product, p, dmax, distOA, I_ids, J_
     A_allowed = {(i,k) for i in I_ids for k in K_ids if distOA[i][k] <= float(dmax) + 1e-9}
     unreachable_i = [i for i in I_ids if all((i,k) not in A_allowed for k in K_ids)]
     if unreachable_i:
-        names = [f"{(dane_to_name.get(to_dane(i,id_to_dane,dane_to_name),'?'))}" for i in unreachable_i[:10]]
+        names = [strip_accents(dane_to_name.get(to_dane(i,id_to_dane,dane_to_name),'?')) for i in unreachable_i[:10]]
         extra = " ..." if len(unreachable_i) > 10 else ""
         reasons.append(f"{len(unreachable_i)} municipio(s) sin acopio dentro de DMAX={dmax} km: " + ", ".join(names) + extra)
 
     return reasons
 
 # ------------------------------------------------------------
-# Modelo Pyomo + HiGHS (con DMAX y centroides forzados)
-# backend: "highs" o "appsi_highs"
+# Modelo Pyomo + HiGHS
 # ------------------------------------------------------------
 def build_and_solve(product, p, dmax, forced_danes, datos, backend="highs"):
     oferta  = datos["oferta"]; demanda = datos["demanda"]
@@ -313,7 +311,7 @@ def build_and_solve(product, p, dmax, forced_danes, datos, backend="highs"):
     m.BalanceR = pyo.Constraint(m.K, rule=balance_rule)
 
     def cap_rule(_m, k):
-        return sum(_m.X[(i,k), product] for (i,kk) in _m.A if kk==k) <= cap.get(k,0.0) * _m.T[k]
+        return sum(_m.X[(i,k), product] for (i,kk) in _m.A if kk==k) <= cap.get(int(k),0.0) * _m.T[k]
     m.CapR = pyo.Constraint(m.K, rule=cap_rule)
 
     def act_rule(_m):
@@ -352,7 +350,7 @@ def build_and_solve(product, p, dmax, forced_danes, datos, backend="highs"):
         solver.config.load_solution = True
         solver.config.stream_solver = False
 
-    res = solver.solve(m)  # sin tee
+    res = solver.solve(m)
     status = str(res.solver.termination_condition)
     msgs = []
     if status.lower() not in ("optimal", "optimal termination", "feasible"):
@@ -361,7 +359,7 @@ def build_and_solve(product, p, dmax, forced_danes, datos, backend="highs"):
     return m, msgs, forced_k
 
 # ------------------------------------------------------------
-# Extracción de resultados (solo NOMBRES, sin DANE)
+# Resultados (solo nombres, sin DANE) + nombres sin tildes
 # ------------------------------------------------------------
 def extract_results(m, datos, product):
     id_to_dane = datos["id_to_dane"]; dane_to_name = datos["dane_to_name"]
@@ -370,7 +368,7 @@ def extract_results(m, datos, product):
 
     def to_name_from_node(node_id):
         dane = to_dane(node_id, id_to_dane, dane_to_name)
-        return _fix_name(dane_to_name.get(int(dane), f"ID {node_id}"))
+        return strip_accents(dane_to_name.get(int(dane), f"ID {node_id}"))
 
     # CENTROS
     centros = []
@@ -459,7 +457,7 @@ def esri_to_geojson_reproject(esri_path: Path):
         props = f.get("properties") or f.get("attributes") or {}
         mp = props.get("MpCodigo") or props.get("MPCodigo") or props.get("mpcodigo")
         props["MpCodigo_norm"] = _to_int_safe(mp)
-        props["MpNombre"] = _fix_name(props.get("MpNombre") or props.get("MPNombre") or props.get("mpnombre") or "")
+        props["MpNombre"] = strip_accents(props.get("MpNombre") or props.get("MPNombre") or props.get("mpnombre") or "")
         geom = f.get("geometry") or {}
         if "rings" in geom:
             rings = geom["rings"]
@@ -472,26 +470,38 @@ def esri_to_geojson_reproject(esri_path: Path):
     return {"type": "FeatureCollection", "features": gj_features}
 
 @st.cache_data(show_spinner=False)
-def build_map_html(geojson_fc, df_geo, df_asigs, df_centros, dane_to_name, dane_to_xy):
+def build_map_html(geojson_fc, df_geo, df_asigs, df_centros, dane_to_name, dane_to_xy, name_to_dane):
+    # Centro del mapa
     coords_all = [(float(r.lat), float(r.lon)) for _, r in df_geo.dropna(subset=["lat","lon"]).iterrows()]
     clat = sum(a for a,_ in coords_all)/len(coords_all) if coords_all else 2.93
     clon = sum(b for _,b in coords_all)/len(coords_all) if coords_all else -75.28
     fmap = folium.Map(location=[clat, clon], zoom_start=8, tiles="cartodbpositron")
 
+    # Paleta
     palette = ["#1f77b4","#ff7f0e","#2ca02c","#d62728","#9467bd","#8c564b","#e377c2","#7f7f7f","#bcbd22","#17becf"]
     centros_orden = sorted(df_centros["centro_nombre"].dropna().unique()) if not df_centros.empty else []
     color_by_centro = {c: palette[i % len(palette)] for i, c in enumerate(centros_orden)}
 
-    cluster_by_mun = {}
+    # --- Join por DANE (seguro) ---
+    # Mapa municipio_dane -> centro_dane (usando name_to_dane)
+    cluster_by_dane = {}
     if not df_asigs.empty:
         for _, r in df_asigs.iterrows():
-            cluster_by_mun[_fix_name(r["municipio_nombre"])] = _fix_name(r["centro_nombre"])
+            mun_name = str(r["municipio_nombre"])
+            cen_name = str(r["centro_nombre"])
+            mun_dane = name_to_dane.get(mun_name)
+            cen_dane = name_to_dane.get(cen_name)
+            if mun_dane is not None and cen_dane is not None:
+                cluster_by_dane[int(mun_dane)] = int(cen_dane)
 
+    # Estilo por polígono usando MpCodigo_norm
     def style_fn(feat):
-        nombre = _fix_name(feat["properties"].get("MpNombre",""))
-        c = cluster_by_mun.get(nombre)
-        if c:
-            return {"fillColor": color_by_centro.get(c, "#cccccc"), "color": "#555", "weight": 0.8, "fillOpacity": 0.6}
+        dane = feat["properties"].get("MpCodigo_norm")
+        if dane in cluster_by_dane:
+            c_dane = cluster_by_dane[dane]
+            c_name = dane_to_name.get(int(c_dane), "")
+            c_name = strip_accents(c_name)
+            return {"fillColor": color_by_centro.get(c_name, "#cccccc"), "color": "#555", "weight": 0.8, "fillOpacity": 0.6}
         else:
             return {"fillColor": "#ddd", "color": "#999", "weight": 0.5, "fillOpacity": 0.3}
 
@@ -502,25 +512,23 @@ def build_map_html(geojson_fc, df_geo, df_asigs, df_centros, dane_to_name, dane_
         tooltip=folium.GeoJsonTooltip(fields=["MpNombre","MpCodigo_norm"], aliases=["Municipio","DANE"])
     ).add_to(fmap)
 
-    # Marcadores: centros (usamos dane_to_xy)
+    # Marcadores de centros (por DANE->XY)
     if not df_centros.empty:
         for _, r in df_centros.iterrows():
-            # buscar (lat, lon) por nombre via inverse map
-            name = r["centro_nombre"]
-            # intenta encontrar cualquier DANE cuyo nombre coincida
-            maybe_danes = [k for k,v in dane_to_name.items() if _fix_name(v)==name]
-            if maybe_danes:
-                lat, lon = dane_to_xy.get(maybe_danes[0], (None, None))
-                if None not in (lat,lon):
-                    folium.CircleMarker(
-                        location=[lat,lon], radius=7, color=color_by_centro.get(name, "#333"),
-                        fill=True, fill_opacity=0.95, popup=f"Centro: {name}"
-                    ).add_to(fmap)
+            c_name = str(r["centro_nombre"])
+            c_dane = name_to_dane.get(c_name)
+            if c_dane is None: continue
+            lat, lon = dane_to_xy.get(int(c_dane), (None, None))
+            if None in (lat,lon): continue
+            folium.CircleMarker(
+                location=[lat,lon], radius=7, color=color_by_centro.get(c_name, "#333"),
+                fill=True, fill_opacity=0.95, popup=f"Centro: {c_name}"
+            ).add_to(fmap)
 
     return fmap.get_root().render()
 
 # ------------------------------------------------------------
-# Curva costo vs p (1..15) usando appsi_highs (robusto)
+# Curva costo vs p (1..15) usando appsi_highs
 # ------------------------------------------------------------
 def cost_curve_1_15(product, datos):
     points = []
@@ -555,9 +563,10 @@ with st.sidebar:
     p = st.number_input("Cantidad de clústeres (p)", min_value=1, max_value=p_max_allowed,
                         value=min(datos["p_default"], p_max_allowed), step=1, help=f"Máximo permitido: {p_max_allowed}")
 
+    # centroides forzados por NOMBRE (sin tildes)
     dane_to_name = datos["dane_to_name"]
-    name_to_dane = {v: k for k, v in dane_to_name.items()}
-    candidatos = sorted({_fix_name(dane_to_name.get(to_dane(k, datos["id_to_dane"], dane_to_name), f"ID {k}")) for k in datos["K_ids"]})
+    name_to_dane = datos["name_to_dane"]
+    candidatos = sorted({strip_accents(dane_to_name.get(to_dane(k, datos["id_to_dane"], dane_to_name), f"ID {k}")) for k in datos["K_ids"]})
 
     forced_names = st.multiselect(f"Municipios que deben ser centros (0..{p})",
                                   options=candidatos, default=[],
@@ -584,7 +593,7 @@ with tabs[0]:
             st.stop()
         with st.spinner("Resolviendo modelo..."):
             m, msgs, forced_k = build_and_solve(producto, int(p), float(dmax), forced_danes, datos, backend="highs")
-            if (m is None) or msgs:  # reintento robusto
+            if (m is None) or msgs:
                 m2, msgs2, _ = build_and_solve(producto, int(p), float(dmax), forced_danes, datos, backend="appsi_highs")
                 if (m2 is not None) and not msgs2:
                     m, msgs = m2, []
@@ -633,7 +642,8 @@ with tabs[0]:
         esri_path = DATA_DIR / "huila_municipios.json"
         try:
             geo_fc = esri_to_geojson_reproject(esri_path)
-            map_html = build_map_html(geo_fc, datos["df_geo"], df_asigs, df_centros, datos["dane_to_name"], datos["dane_to_xy"])
+            map_html = build_map_html(geo_fc, datos["df_geo"], df_asigs, df_centros,
+                                      datos["dane_to_name"], datos["dane_to_xy"], datos["name_to_dane"])
             html(map_html, height=650)
         except Exception as e:
             st.error(f"No se pudo generar el mapa: {e}")
@@ -641,7 +651,7 @@ with tabs[0]:
 # ------------------------- TAB 2 -------------------------
 with tabs[1]:
     st.write("Ejecuta el modelo desde **1 a 15 clústeres** (sin restricción de distancias) para un producto seleccionado.")
-    producto_curve = st.selectbox("Producto para la curva", productos_validos, index=0, key="prod_curve")
+    producto_curve = st.selectbox("Producto para la curva", datos["productos_validos"], index=0, key="prod_curve")
     run_curve = st.button("Calcular curva costo vs p (1..15)", type="primary")
 
     if run_curve:
